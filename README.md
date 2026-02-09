@@ -19,6 +19,7 @@ Gebruik bovenstaande specificatie als leidende bron voor berichttypes, velden en
   - `ai` (`/ai`)
 - Rendert inkomende serverberichten:
   - `chat`, `system`, `ackName`, `status`, `listUsers`, `error`, `pong`, `ai`
+- Toont event timestamps (`at`) als lokale NL tijd (`HH:MM:SS`, `Europe/Amsterdam`).
 
 ## Installatie en draaien
 Vereist: recente Rust toolchain (edition 2021).
@@ -27,7 +28,12 @@ Vereist: recente Rust toolchain (edition 2021).
 cargo run
 ```
 
-De GUI start met een invoerveld voor server URL en connect/disconnect knop.
+## Tests en controle
+
+```bash
+cargo check
+cargo test
+```
 
 ## Gebruik
 - Typ gewone tekst om `chat` te versturen.
@@ -38,11 +44,26 @@ De GUI start met een invoerveld voor server URL en connect/disconnect knop.
   - `/ping [token]`
   - `/ai <vraag>`
 
+Opmerking naamgedrag:
+- Een naam gezet via `/name` wordt als voorkeurnaam opgeslagen.
+- Bij een nieuwe connectie probeert de client die naam automatisch opnieuw te zetten.
+
+## Persistente settings
+De client bewaart instellingen lokaal:
+- pad: `~/.config/cybox-chat-gui/settings.json`
+- velden: `server_url`, `username` (voorkeurnaam)
+
+Legacy fallback:
+- Als aanwezig wordt oude `/.cybox-chat-gui-settings.json` in de projectmap nog gelezen.
+
 ## Structuur
-- `src/main.rs`: volledige app (UI, websocket connectie, command parsing, rendering).
+- `src/main.rs`: GUI en eventverwerking.
+- `src/network.rs`: WebSocket transportlaag en connectie-foutdiagnostiek.
+- `src/protocol.rs`: protocolmodellen + input/incoming parsing + unit-tests.
+- `src/settings.rs`: laden/opslaan van settings.
 - `Cargo.toml`: dependencies en binary configuratie.
 
 ## Opmerkingen
-- De server kan extra velden sturen (bijv. `at` timestamps); deze client parseert alleen de velden die hij gebruikt.
 - Houd compatibiliteit aan met de protocolspec:
   https://raw.githubusercontent.com/pa1bh/chatserver/refs/heads/main/REQUIREMENTS-CLIENTS.md
+- Parser is defensief: onbekende/ongeldige serverberichten geven een zichtbare waarschuwing in de UI.
