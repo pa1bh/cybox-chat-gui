@@ -33,6 +33,14 @@ enum ChatLine {
         text: String,
         at: Option<u64>,
     },
+    StatusCard {
+        at: Option<u64>,
+        rows: Vec<(String, String)>,
+    },
+    UsersCard {
+        at: Option<u64>,
+        users: Vec<(String, String, String)>,
+    },
     Ai {
         from: String,
         prompt: String,
@@ -213,59 +221,53 @@ impl ChatApp {
                         ai_model,
                         at,
                     }) => {
-                        let mut lines = vec![format!("Server Status v{}", version)];
+                        let mut rows = vec![
+                            ("Version".to_string(), version),
+                            ("Uptime".to_string(), format_uptime(uptime_seconds)),
+                        ];
 
                         if let Some(os_name) = os {
-                            let cores = cpu_cores
-                                .map(|c| format!(" ({} cores)", c))
-                                .unwrap_or_default();
-                            lines.push(format!("Platform: {}{}", os_name, cores));
+                            rows.push((
+                                "Platform".to_string(),
+                                cpu_cores
+                                    .map(|c| format!("{} ({} cores)", os_name, c))
+                                    .unwrap_or(os_name),
+                            ));
                         }
                         if let Some(rust_ver) = rust_version {
-                            lines.push(format!("Rust: {}", rust_ver));
+                            rows.push(("Rust".to_string(), rust_ver));
                         }
-                        lines.push(format!("Uptime: {}", format_uptime(uptime_seconds)));
-                        let peak = peak_users
-                            .map(|p| format!(" (peak: {})", p))
-                            .unwrap_or_default();
-                        lines.push(format!("Users: {}{}", user_count, peak));
+                        let users_value = if let Some(peak) = peak_users {
+                            format!("{} (peak: {})", user_count, peak)
+                        } else {
+                            user_count.to_string()
+                        };
+                        rows.push(("Users".to_string(), users_value));
                         if let Some(conns) = connections_total {
-                            lines.push(format!("Connections: {}", conns));
+                            rows.push(("Connections".to_string(), conns.to_string()));
                         }
-                        lines.push(format!("Messages: {}", messages_sent));
-                        lines.push(format!("Throughput: {} msg/s", messages_per_second));
-                        lines.push(format!("Memory: {:.2} MB", memory_mb));
+                        rows.push(("Messages".to_string(), messages_sent.to_string()));
+                        rows.push((
+                            "Throughput".to_string(),
+                            format!("{:.2} msg/s", messages_per_second),
+                        ));
+                        rows.push(("Memory".to_string(), format!("{:.2} MB", memory_mb)));
                         if let Some(enabled) = ai_enabled {
                             let ai_status = if enabled {
                                 ai_model.unwrap_or_else(|| "enabled".to_string())
                             } else {
                                 "disabled".to_string()
                             };
-                            lines.push(format!("AI: {}", ai_status));
+                            rows.push(("AI".to_string(), ai_status));
                         }
-
-                        for line in lines {
-                            self.messages.push(ChatLine::Status { text: line, at });
-                        }
+                        self.messages.push(ChatLine::StatusCard { at, rows });
                     }
                     UiEvent::Incoming(Incoming::ListUsers { users, at }) => {
-                        if users.is_empty() {
-                            self.messages.push(ChatLine::Status {
-                                text: "No users connected".to_string(),
-                                at,
-                            });
-                        } else {
-                            self.messages.push(ChatLine::Status {
-                                text: format!("Users ({})", users.len()),
-                                at,
-                            });
-                            for u in &users {
-                                self.messages.push(ChatLine::Status {
-                                    text: format!("  {}  {}  {}", u.id, u.name, u.ip),
-                                    at,
-                                });
-                            }
-                        }
+                        let mapped = users
+                            .into_iter()
+                            .map(|u| (u.name, u.ip, u.id))
+                            .collect::<Vec<_>>();
+                        self.messages.push(ChatLine::UsersCard { at, users: mapped });
                     }
                     UiEvent::Incoming(Incoming::Error { message, at }) => {
                         let prefix = format_at_prefix(at);
@@ -417,6 +419,91 @@ impl ChatApp {
                     .show(ui, |ui| {
                         let prefix = format_at_prefix(*at);
                         ui.label(egui::RichText::new(format!("{}{}", prefix, text)).color(egui::Color32::from_rgb(166, 204, 245)));
+                    });
+            }
+            ChatLine::StatusCard { at, rows } => {
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(27, 40, 58))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(83, 119, 161)))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| {
+                        let prefix = format_at_prefix(*at);
+                        ui.label(
+                            egui::RichText::new(format!("{}Server status", prefix))
+                                .strong()
+                                .color(egui::Color32::from_rgb(182, 216, 249)),
+                        );
+                        ui.add_space(4.0);
+                        for (label, value) in rows {
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [110.0, 18.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(label)
+                                            .small()
+                                            .color(egui::Color32::from_gray(178)),
+                                    ),
+                                );
+                                ui.label(
+                                    egui::RichText::new(value)
+                                        .color(egui::Color32::from_rgb(214, 230, 248)),
+                                );
+                            });
+                        }
+                    });
+            }
+            ChatLine::UsersCard { at, users } => {
+                egui::Frame::default()
+                    .fill(egui::Color32::from_rgb(28, 43, 56))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(89, 126, 160)))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| {
+                        let prefix = format_at_prefix(*at);
+                        ui.label(
+                            egui::RichText::new(format!("{}Users ({})", prefix, users.len()))
+                                .strong()
+                                .color(egui::Color32::from_rgb(182, 216, 249)),
+                        );
+                        ui.add_space(4.0);
+                        if users.is_empty() {
+                            ui.label(
+                                egui::RichText::new("No users connected")
+                                    .color(egui::Color32::from_gray(180)),
+                            );
+                        } else {
+                            for (name, ip, id) in users {
+                                egui::Frame::default()
+                                    .fill(egui::Color32::from_rgb(24, 36, 48))
+                                    .stroke(egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgb(62, 86, 110),
+                                    ))
+                                    .rounding(egui::Rounding::same(6.0))
+                                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(name)
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(208, 228, 250)),
+                                            );
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new(ip)
+                                                    .color(egui::Color32::from_gray(184)),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(format!("id: {}", id))
+                                                .small()
+                                                .color(egui::Color32::from_gray(146)),
+                                        );
+                                    });
+                                ui.add_space(4.0);
+                            }
+                        }
                     });
             }
             ChatLine::Ai {
