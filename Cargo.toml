@@ -8,6 +8,8 @@ name = "cybox-chat-gui"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
 eframe = "0.30"
 futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
