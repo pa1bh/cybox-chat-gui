@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 use std::time::Instant;
 
 use eframe::egui;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::tungstenite::Message;
 
 fn format_uptime(seconds: u64) -> String {
@@ -34,6 +35,12 @@ enum Outgoing {
     Ping { token: Option<String> },
     #[serde(rename = "ai")]
     Ai { prompt: String },
+}
+
+#[derive(Debug, Clone)]
+enum WsCommand {
+    Send(Outgoing),
+    Disconnect,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -90,6 +97,15 @@ enum Incoming {
     },
 }
 
+#[derive(Debug, Clone)]
+enum UiEvent {
+    Connected,
+    Disconnected(Option<String>),
+    Incoming(Incoming),
+    Warning(String),
+    Error(String),
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct UserInfo {
     id: String,
@@ -122,11 +138,9 @@ struct ChatApp {
     username: String,
 
     // Channel to send messages to WebSocket
-    ws_tx: Option<Sender<Outgoing>>,
-    // Channel to receive messages from WebSocket
-    ui_rx: Option<Receiver<Incoming>>,
-    // Channel to receive connection status
-    status_rx: Option<Receiver<bool>>,
+    ws_tx: Option<UnboundedSender<WsCommand>>,
+    // Channel to receive events from WebSocket thread
+    ui_rx: Option<Receiver<UiEvent>>,
     // Pending ping requests for roundtrip calculation
     pending_pings: HashMap<String, Instant>,
 }
@@ -141,7 +155,6 @@ impl Default for ChatApp {
             username: String::new(),
             ws_tx: None,
             ui_rx: None,
-            status_rx: None,
             pending_pings: HashMap::new(),
         }
     }
@@ -152,15 +165,12 @@ impl ChatApp {
         let url = self.server_url.clone();
 
         // Channel for sending messages to WebSocket
-        let (ws_tx, ws_rx) = channel::<Outgoing>();
-        // Channel for receiving messages from WebSocket
-        let (ui_tx, ui_rx) = channel::<Incoming>();
-        // Channel for connection status
-        let (status_tx, status_rx) = channel::<bool>();
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel::<WsCommand>();
+        // Channel for receiving events from WebSocket thread
+        let (ui_tx, ui_rx) = channel::<UiEvent>();
 
         self.ws_tx = Some(ws_tx);
         self.ui_rx = Some(ui_rx);
-        self.status_rx = Some(status_rx);
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -169,17 +179,25 @@ impl ChatApp {
 
                 match result {
                     Ok((ws_stream, _)) => {
-                        let _ = status_tx.send(true);
+                        let _ = ui_tx.send(UiEvent::Connected);
                         ctx.request_repaint();
 
                         let (mut write, mut read) = ws_stream.split();
 
                         // Spawn writer task
                         let write_handle = tokio::spawn(async move {
-                            while let Ok(msg) = ws_rx.recv() {
-                                let json = serde_json::to_string(&msg).unwrap();
-                                if write.send(Message::Text(json.into())).await.is_err() {
-                                    break;
+                            while let Some(cmd) = ws_rx.recv().await {
+                                match cmd {
+                                    WsCommand::Send(msg) => {
+                                        let json = serde_json::to_string(&msg).unwrap();
+                                        if write.send(Message::Text(json.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    WsCommand::Disconnect => {
+                                        let _ = write.send(Message::Close(None)).await;
+                                        break;
+                                    }
                                 }
                             }
                         });
@@ -189,21 +207,53 @@ impl ChatApp {
                             match msg {
                                 Ok(Message::Text(text)) => {
                                     if let Ok(incoming) = serde_json::from_str::<Incoming>(&text) {
-                                        let _ = ui_tx.send(incoming);
+                                        let _ = ui_tx.send(UiEvent::Incoming(incoming));
+                                        ctx.request_repaint();
+                                    } else {
+                                        let warning = if let Ok(value) =
+                                            serde_json::from_str::<serde_json::Value>(&text)
+                                        {
+                                            if let Some(msg_type) =
+                                                value.get("type").and_then(|v| v.as_str())
+                                            {
+                                                format!(
+                                                    "Unknown server message type: {}",
+                                                    msg_type
+                                                )
+                                            } else {
+                                                "Server sent JSON without a valid 'type' field."
+                                                    .to_string()
+                                            }
+                                        } else {
+                                            "Server sent invalid JSON.".to_string()
+                                        };
+                                        let _ = ui_tx.send(UiEvent::Warning(warning));
                                         ctx.request_repaint();
                                     }
                                 }
-                                Ok(Message::Close(_)) | Err(_) => break,
+                                Ok(Message::Close(_)) => break,
+                                Err(err) => {
+                                    let _ = ui_tx.send(UiEvent::Disconnected(Some(format!(
+                                        "Connection closed with error: {}",
+                                        err
+                                    ))));
+                                    ctx.request_repaint();
+                                    break;
+                                }
                                 _ => {}
                             }
                         }
 
                         write_handle.abort();
-                        let _ = status_tx.send(false);
+                        let _ = ui_tx.send(UiEvent::Disconnected(None));
                         ctx.request_repaint();
                     }
-                    Err(_) => {
-                        let _ = status_tx.send(false);
+                    Err(err) => {
+                        let _ = ui_tx.send(UiEvent::Error(format!(
+                            "Connection failed: {}",
+                            err
+                        )));
+                        let _ = ui_tx.send(UiEvent::Disconnected(None));
                         ctx.request_repaint();
                     }
                 }
@@ -217,6 +267,14 @@ impl ChatApp {
             return;
         }
 
+        if !text.starts_with('/') && text.chars().count() > 500 {
+            self.messages.push(ChatLine::Error(
+                "Message is too long (max 500 characters).".to_string(),
+            ));
+            self.input.clear();
+            return;
+        }
+
         if let Some(tx) = &self.ws_tx {
             if text.starts_with('/') {
                 let parts: Vec<&str> = text.splitn(2, ' ').collect();
@@ -225,17 +283,35 @@ impl ChatApp {
 
                 match cmd.as_str() {
                     "/name" => {
-                        if !arg.is_empty() {
-                            let _ = tx.send(Outgoing::SetName {
-                                name: arg.to_string(),
+                        if arg.is_empty() {
+                            self.messages
+                                .push(ChatLine::Error("Usage: /name <new_name>".to_string()));
+                        } else {
+                            let name_len = arg.chars().count();
+                            let name_valid = arg.chars().all(|c| {
+                                c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_'
                             });
+                            if !(2..=32).contains(&name_len) {
+                                self.messages.push(ChatLine::Error(
+                                    "Naam moet tussen 2 en 32 tekens zijn.".to_string(),
+                                ));
+                            } else if !name_valid {
+                                self.messages.push(ChatLine::Error(
+                                    "Naam mag alleen letters, cijfers, spaties, - en _ bevatten."
+                                        .to_string(),
+                                ));
+                            } else {
+                                let _ = tx.send(WsCommand::Send(Outgoing::SetName {
+                                    name: arg.to_string(),
+                                }));
+                            }
                         }
                     }
                     "/status" => {
-                        let _ = tx.send(Outgoing::Status);
+                        let _ = tx.send(WsCommand::Send(Outgoing::Status));
                     }
                     "/users" => {
-                        let _ = tx.send(Outgoing::ListUsers);
+                        let _ = tx.send(WsCommand::Send(Outgoing::ListUsers));
                     }
                     "/ping" => {
                         let token = if arg.is_empty() {
@@ -244,18 +320,22 @@ impl ChatApp {
                             arg.to_string()
                         };
                         self.pending_pings.insert(token.clone(), Instant::now());
-                        let _ = tx.send(Outgoing::Ping { token: Some(token) });
+                        let _ = tx.send(WsCommand::Send(Outgoing::Ping { token: Some(token) }));
                     }
                     "/ai" => {
                         if arg.is_empty() {
                             self.messages
                                 .push(ChatLine::Error("Usage: /ai <question>".to_string()));
+                        } else if arg.chars().count() > 1000 {
+                            self.messages.push(ChatLine::Error(
+                                "Vraag is te lang (max 1000 tekens).".to_string(),
+                            ));
                         } else {
                             self.messages
                                 .push(ChatLine::System("AI is thinking...".to_string()));
-                            let _ = tx.send(Outgoing::Ai {
+                            let _ = tx.send(WsCommand::Send(Outgoing::Ai {
                                 prompt: arg.to_string(),
-                            });
+                            }));
                         }
                     }
                     _ => {
@@ -264,7 +344,7 @@ impl ChatApp {
                     }
                 }
             } else {
-                let _ = tx.send(Outgoing::Chat { text });
+                let _ = tx.send(WsCommand::Send(Outgoing::Chat { text }));
             }
         }
 
@@ -273,20 +353,41 @@ impl ChatApp {
 
     fn process_incoming(&mut self) {
         if let Some(rx) = &self.ui_rx {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    Incoming::Chat { from, text } => {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    UiEvent::Connected => {
+                        self.connected = true;
+                        self.messages
+                            .push(ChatLine::System("Connected!".to_string()));
+                    }
+                    UiEvent::Disconnected(reason) => {
+                        self.connected = false;
+                        self.ws_tx = None;
+                        self.pending_pings.clear();
+                        if let Some(reason) = reason {
+                            self.messages.push(ChatLine::Error(reason));
+                        }
+                        self.messages
+                            .push(ChatLine::System("Disconnected".to_string()));
+                    }
+                    UiEvent::Warning(text) => {
+                        self.messages.push(ChatLine::Error(text));
+                    }
+                    UiEvent::Error(text) => {
+                        self.messages.push(ChatLine::Error(text));
+                    }
+                    UiEvent::Incoming(Incoming::Chat { from, text }) => {
                         self.messages.push(ChatLine::Chat { from, text });
                     }
-                    Incoming::System { text } => {
+                    UiEvent::Incoming(Incoming::System { text }) => {
                         self.messages.push(ChatLine::System(text));
                     }
-                    Incoming::AckName { name } => {
+                    UiEvent::Incoming(Incoming::AckName { name }) => {
                         self.username = name.clone();
                         self.messages
                             .push(ChatLine::System(format!("Your name is now: {}", name)));
                     }
-                    Incoming::Status {
+                    UiEvent::Incoming(Incoming::Status {
                         version,
                         rust_version,
                         os,
@@ -300,7 +401,7 @@ impl ChatApp {
                         memory_mb,
                         ai_enabled,
                         ai_model,
-                    } => {
+                    }) => {
                         let mut lines = vec![format!("Server Status v{}", version)];
 
                         if let Some(os_name) = os {
@@ -336,7 +437,7 @@ impl ChatApp {
                             self.messages.push(ChatLine::Status(line));
                         }
                     }
-                    Incoming::ListUsers { users } => {
+                    UiEvent::Incoming(Incoming::ListUsers { users }) => {
                         if users.is_empty() {
                             self.messages
                                 .push(ChatLine::Status("No users connected".to_string()));
@@ -351,10 +452,10 @@ impl ChatApp {
                             }
                         }
                     }
-                    Incoming::Error { message } => {
+                    UiEvent::Incoming(Incoming::Error { message }) => {
                         self.messages.push(ChatLine::Error(message));
                     }
-                    Incoming::Pong { token } => {
+                    UiEvent::Incoming(Incoming::Pong { token }) => {
                         let roundtrip = token.as_ref().and_then(|t| {
                             self.pending_pings.remove(t).map(|start| start.elapsed())
                         });
@@ -373,14 +474,14 @@ impl ChatApp {
                                 .push(ChatLine::Status(format!("Pong!{}", token_str)));
                         }
                     }
-                    Incoming::Ai {
+                    UiEvent::Incoming(Incoming::Ai {
                         from,
                         prompt,
                         response,
                         response_ms,
                         tokens,
                         cost,
-                    } => {
+                    }) => {
                         let mut stats_parts = vec![format!("{}ms", response_ms)];
                         if let Some(t) = tokens {
                             stats_parts.push(format!("{} tokens", t));
@@ -398,19 +499,6 @@ impl ChatApp {
                 }
             }
         }
-
-        if let Some(rx) = &self.status_rx {
-            while let Ok(status) = rx.try_recv() {
-                self.connected = status;
-                if status {
-                    self.messages
-                        .push(ChatLine::System("Connected!".to_string()));
-                } else {
-                    self.messages
-                        .push(ChatLine::System("Disconnected".to_string()));
-                }
-            }
-        }
     }
 }
 
@@ -425,10 +513,13 @@ impl eframe::App for ChatApp {
 
                 if self.connected {
                     if ui.button("Disconnect").clicked() {
-                        self.ws_tx = None;
+                        if let Some(tx) = self.ws_tx.take() {
+                            let _ = tx.send(WsCommand::Disconnect);
+                        }
                         self.connected = false;
+                        self.pending_pings.clear();
                         self.messages
-                            .push(ChatLine::System("Disconnected".to_string()));
+                            .push(ChatLine::System("Disconnect requested".to_string()));
                     }
                     ui.label(egui::RichText::new("● Connected").color(egui::Color32::GREEN));
                     if !self.username.is_empty() {
