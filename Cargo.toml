@@ -1,10 +1,10 @@
 [package]
-name = "rust-gui"
-version = "0.1.1"
+name = "cybox-chat-gui"
+version = "0.1.2"
 edition = "2021"
 
 [[bin]]
-name = "chat-gui"
+name = "cybox-chat-gui"
 path = "src/main.rs"
 
 [dependencies]
