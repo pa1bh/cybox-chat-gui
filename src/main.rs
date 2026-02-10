@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Instant;
 
@@ -12,6 +12,10 @@ mod settings;
 use network::{start_connection, UiEvent, WsCommand};
 use protocol::{format_at_prefix, format_uptime, parse_user_input, Incoming, Outgoing, ParsedInput};
 use settings::{load_settings, save_settings, AppSettings};
+
+const AUTO_PING_INTERVAL_SECS: u64 = 5;
+const MAX_LATENCY_SAMPLES: usize = 100;
+const AUTO_PING_PREFIX: &str = "auto-";
 
 fn is_guest_name(name: &str) -> bool {
     name.trim().to_ascii_lowercase().starts_with("guest-")
@@ -64,6 +68,8 @@ struct ChatApp {
     ui_rx: Option<Receiver<UiEvent>>,
     // Pending ping requests for roundtrip calculation
     pending_pings: HashMap<String, Instant>,
+    latency_samples: VecDeque<f32>,
+    last_auto_ping_sent: Option<Instant>,
     theme_initialized: bool,
 }
 
@@ -85,6 +91,8 @@ impl Default for ChatApp {
             ws_tx: None,
             ui_rx: None,
             pending_pings: HashMap::new(),
+            latency_samples: VecDeque::new(),
+            last_auto_ping_sent: None,
             theme_initialized: false,
         }
     }
@@ -162,6 +170,7 @@ impl ChatApp {
             match event {
                     UiEvent::Connected => {
                         self.connected = true;
+                        self.last_auto_ping_sent = Some(Instant::now());
                         if !self.preferred_username.trim().is_empty()
                             && !is_guest_name(&self.preferred_username)
                         {
@@ -178,6 +187,7 @@ impl ChatApp {
                         self.connected = false;
                         self.ws_tx = None;
                         self.pending_pings.clear();
+                        self.last_auto_ping_sent = None;
                         if let Some(reason) = reason {
                             self.messages.push(ChatLine::Error(reason));
                         }
@@ -277,24 +287,35 @@ impl ChatApp {
                         let roundtrip = token
                             .as_ref()
                             .and_then(|t| self.pending_pings.remove(t).map(|start| start.elapsed()));
+                        let is_auto_ping = token
+                            .as_ref()
+                            .map(|t| t.starts_with(AUTO_PING_PREFIX))
+                            .unwrap_or(false);
                         let token_str = token
                             .as_ref()
                             .map(|t| format!(" (token: {}...)", &t[..8.min(t.len())]))
                             .unwrap_or_default();
                         if let Some(rtt) = roundtrip {
-                            self.messages.push(ChatLine::Status {
-                                text: format!(
-                                    "Pong! roundtrip: {:.2}ms{}",
-                                    rtt.as_secs_f64() * 1000.0,
-                                    token_str
-                                ),
-                                at,
-                            });
+                            let rtt_ms = (rtt.as_secs_f64() * 1000.0) as f32;
+                            if is_auto_ping {
+                                self.record_latency_sample(rtt_ms);
+                            } else {
+                                self.messages.push(ChatLine::Status {
+                                    text: format!(
+                                        "Pong! roundtrip: {:.2}ms{}",
+                                        rtt.as_secs_f64() * 1000.0,
+                                        token_str
+                                    ),
+                                    at,
+                                });
+                            }
                         } else {
-                            self.messages.push(ChatLine::Status {
-                                text: format!("Pong!{}", token_str),
-                                at,
-                            });
+                            if !is_auto_ping {
+                                self.messages.push(ChatLine::Status {
+                                    text: format!("Pong!{}", token_str),
+                                    at,
+                                });
+                            }
                         }
                     }
                     UiEvent::Incoming(Incoming::Ai {
@@ -323,6 +344,137 @@ impl ChatApp {
                     }
                 }
         }
+    }
+
+    fn record_latency_sample(&mut self, ms: f32) {
+        self.latency_samples.push_back(ms);
+        while self.latency_samples.len() > MAX_LATENCY_SAMPLES {
+            let _ = self.latency_samples.pop_front();
+        }
+    }
+
+    fn maybe_send_auto_ping(&mut self) {
+        if !self.connected {
+            return;
+        }
+        let now = Instant::now();
+        let should_ping = self
+            .last_auto_ping_sent
+            .map(|last| now.duration_since(last).as_secs() >= AUTO_PING_INTERVAL_SECS)
+            .unwrap_or(true);
+        if !should_ping {
+            return;
+        }
+
+        if let Some(tx) = &self.ws_tx {
+            let token = format!("{}{}", AUTO_PING_PREFIX, uuid::Uuid::new_v4());
+            self.pending_pings.insert(token.clone(), now);
+            let _ = tx.send(WsCommand::Send(Outgoing::Ping { token: Some(token) }));
+            self.last_auto_ping_sent = Some(now);
+        }
+    }
+
+    fn draw_latency_graph(&self, ui: &mut egui::Ui, size: egui::Vec2) {
+        let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 8.0, egui::Color32::from_rgb(20, 33, 47));
+        painter.rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(69, 101, 136)),
+        );
+
+        let inner = rect.shrink2(egui::vec2(8.0, 8.0));
+        painter.text(
+            egui::pos2(inner.left(), inner.top()),
+            egui::Align2::LEFT_TOP,
+            "Latency (ms)",
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(183, 214, 245),
+        );
+
+        if self.latency_samples.is_empty() {
+            painter.text(
+                inner.center(),
+                egui::Align2::CENTER_CENTER,
+                "Wachten op metingen...",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_gray(150),
+            );
+            return;
+        }
+
+        let chart_top = inner.top() + 16.0;
+        let chart_bottom = inner.bottom() - 2.0;
+        let chart_left = inner.left() + 2.0;
+        let chart_right = inner.right() - 2.0;
+        let max_value = self
+            .latency_samples
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(20.0);
+
+        for i in 0..=4 {
+            let t = i as f32 / 4.0;
+            let y = egui::lerp(chart_top..=chart_bottom, t);
+            painter.line_segment(
+                [egui::pos2(chart_left, y), egui::pos2(chart_right, y)],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 61, 84)),
+            );
+        }
+        for i in 0..=5 {
+            let t = i as f32 / 5.0;
+            let x = egui::lerp(chart_left..=chart_right, t);
+            painter.line_segment(
+                [egui::pos2(x, chart_top), egui::pos2(x, chart_bottom)],
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 52, 73)),
+            );
+        }
+
+        let mut points = Vec::with_capacity(self.latency_samples.len());
+        let denom = (self.latency_samples.len().saturating_sub(1)).max(1) as f32;
+        for (idx, value) in self.latency_samples.iter().enumerate() {
+            let t = idx as f32 / denom;
+            let x = egui::lerp(chart_left..=chart_right, t);
+            let y = egui::remap_clamp(*value, 0.0..=max_value, chart_bottom..=chart_top);
+            points.push(egui::pos2(x, y));
+        }
+        painter.line_segment(
+            [egui::pos2(chart_left, chart_bottom), egui::pos2(chart_right, chart_bottom)],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(56, 81, 110)),
+        );
+        painter.add(egui::Shape::line(
+            points.clone(),
+            egui::Stroke::new(1.8, egui::Color32::from_rgb(111, 196, 255)),
+        ));
+        if let Some(last) = points.last() {
+            painter.circle_filled(*last, 2.8, egui::Color32::from_rgb(157, 226, 255));
+        }
+
+        if let Some(last_ms) = self.latency_samples.back() {
+            painter.text(
+                egui::pos2(inner.right(), inner.top()),
+                egui::Align2::RIGHT_TOP,
+                format!("{:.1} ms", last_ms),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(157, 226, 255),
+            );
+        }
+        painter.text(
+            egui::pos2(inner.left(), chart_top),
+            egui::Align2::LEFT_TOP,
+            format!("{:.0}", max_value),
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_gray(138),
+        );
+        painter.text(
+            egui::pos2(inner.left(), chart_bottom),
+            egui::Align2::LEFT_BOTTOM,
+            "0",
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_gray(138),
+        );
     }
 
     fn apply_modern_theme(&mut self, ctx: &egui::Context) {
@@ -539,6 +691,7 @@ impl eframe::App for ChatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_modern_theme(ctx);
         self.process_incoming();
+        self.maybe_send_auto_ping();
 
         egui::TopBottomPanel::top("top_panel")
             .resizable(false)
@@ -547,103 +700,137 @@ impl eframe::App for ChatApp {
                     .fill(egui::Color32::from_rgb(24, 34, 48))
                     .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 83, 112)))
                     .rounding(egui::Rounding::same(10.0))
-                    .outer_margin(egui::Margin::symmetric(6.0, 4.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .outer_margin(egui::Margin::symmetric(6.0, 2.0))
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Cybox Chat Client")
-                                    .strong()
-                                    .size(17.0)
-                                    .color(egui::Color32::from_rgb(192, 218, 247)),
-                            );
+                        let graph_size = egui::vec2(285.0, 68.0);
+                        let gap = 8.0;
+                        let left_width = (ui.available_width() - graph_size.x - gap).max(220.0);
 
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let (btn_text, btn_fill) = if self.connected {
-                                    ("Disconnect", egui::Color32::from_rgb(180, 70, 70))
-                                } else {
-                                    ("Connect", egui::Color32::from_rgb(45, 128, 86))
-                                };
-                                let btn = egui::Button::new(
-                                    egui::RichText::new(btn_text).strong().color(egui::Color32::WHITE),
-                                )
-                                .fill(btn_fill)
-                                .rounding(egui::Rounding::same(7.0))
-                                .stroke(egui::Stroke::NONE);
-                                if ui.add(btn).clicked() {
-                                    if self.connected {
-                                        if let Some(tx) = self.ws_tx.take() {
-                                            let _ = tx.send(WsCommand::Disconnect);
-                                        }
-                                        self.connected = false;
-                                        self.pending_pings.clear();
-                                        self.messages.push(ChatLine::System {
-                                            text: "Disconnect requested".to_string(),
-                                            at: None,
-                                        });
-                                    } else {
-                                        self.connect(ctx.clone());
-                                    }
-                                }
-
-                                let (status_text, status_fill, status_stroke, status_dot) = if self.connected {
-                                    (
-                                        "Online",
-                                        egui::Color32::from_rgb(33, 66, 48),
-                                        egui::Color32::from_rgb(77, 138, 107),
-                                        egui::Color32::from_rgb(104, 219, 152),
-                                    )
-                                } else {
-                                    (
-                                        "Offline",
-                                        egui::Color32::from_rgb(73, 38, 42),
-                                        egui::Color32::from_rgb(138, 84, 90),
-                                        egui::Color32::from_rgb(240, 136, 136),
-                                    )
-                                };
-                                egui::Frame::default()
-                                    .fill(status_fill)
-                                    .stroke(egui::Stroke::new(1.0, status_stroke))
-                                    .rounding(egui::Rounding::same(999.0))
-                                    .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(left_width, graph_size.y),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.horizontal(|ui| {
                                         ui.label(
-                                            egui::RichText::new(format!("● {}", status_text))
+                                            egui::RichText::new("Cybox Chat Client")
                                                 .strong()
-                                                .color(status_dot),
+                                                .size(16.0)
+                                                .color(egui::Color32::from_rgb(192, 218, 247)),
+                                        );
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let (btn_text, btn_fill) = if self.connected {
+                                                    ("Disconnect", egui::Color32::from_rgb(180, 70, 70))
+                                                } else {
+                                                    ("Connect", egui::Color32::from_rgb(45, 128, 86))
+                                                };
+                                                let btn = egui::Button::new(
+                                                    egui::RichText::new(btn_text)
+                                                        .strong()
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .fill(btn_fill)
+                                                .rounding(egui::Rounding::same(7.0))
+                                                .stroke(egui::Stroke::NONE);
+                                                if ui.add(btn).clicked() {
+                                                    if self.connected {
+                                                        if let Some(tx) = self.ws_tx.take() {
+                                                            let _ = tx.send(WsCommand::Disconnect);
+                                                        }
+                                                        self.connected = false;
+                                                        self.pending_pings.clear();
+                                                        self.last_auto_ping_sent = None;
+                                                        self.messages.push(ChatLine::System {
+                                                            text: "Disconnect requested".to_string(),
+                                                            at: None,
+                                                        });
+                                                    } else {
+                                                        self.connect(ctx.clone());
+                                                    }
+                                                }
+
+                                                let (status_text, status_fill, status_stroke, status_dot) =
+                                                    if self.connected {
+                                                        (
+                                                            "Online",
+                                                            egui::Color32::from_rgb(33, 66, 48),
+                                                            egui::Color32::from_rgb(77, 138, 107),
+                                                            egui::Color32::from_rgb(104, 219, 152),
+                                                        )
+                                                    } else {
+                                                        (
+                                                            "Offline",
+                                                            egui::Color32::from_rgb(73, 38, 42),
+                                                            egui::Color32::from_rgb(138, 84, 90),
+                                                            egui::Color32::from_rgb(240, 136, 136),
+                                                        )
+                                                    };
+                                                egui::Frame::default()
+                                                    .fill(status_fill)
+                                                    .stroke(egui::Stroke::new(1.0, status_stroke))
+                                                    .rounding(egui::Rounding::same(999.0))
+                                                    .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(format!(
+                                                                "● {}",
+                                                                status_text
+                                                            ))
+                                                            .strong()
+                                                            .color(status_dot),
+                                                        );
+                                                    });
+
+                                                if !self.username.is_empty() {
+                                                    egui::Frame::default()
+                                                        .fill(egui::Color32::from_rgb(31, 44, 61))
+                                                        .stroke(egui::Stroke::new(
+                                                            1.0,
+                                                            egui::Color32::from_rgb(75, 103, 136),
+                                                        ))
+                                                        .rounding(egui::Rounding::same(999.0))
+                                                        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
+                                                        .show(ui, |ui| {
+                                                            ui.label(
+                                                                egui::RichText::new(format!(
+                                                                    "👤 {}",
+                                                                    self.username
+                                                                ))
+                                                                .small()
+                                                                .color(egui::Color32::from_rgb(
+                                                                    169, 206, 246,
+                                                                )),
+                                                            );
+                                                        });
+                                                }
+                                            },
                                         );
                                     });
 
-                                if !self.username.is_empty() {
-                                    egui::Frame::default()
-                                        .fill(egui::Color32::from_rgb(31, 44, 61))
-                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(75, 103, 136)))
-                                        .rounding(egui::Rounding::same(999.0))
-                                        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                                        .show(ui, |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("👤 {}", self.username))
-                                                    .small()
-                                                    .color(egui::Color32::from_rgb(169, 206, 246)),
-                                            );
-                                        });
-                                }
-                            });
-                        });
+                                    ui.add_space(3.0);
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized(
+                                            [42.0, 22.0],
+                                            egui::Label::new(egui::RichText::new("Server").strong()),
+                                        );
+                                        let server_response = ui.add_sized(
+                                            [ui.available_width() - 2.0, 22.0],
+                                            egui::TextEdit::singleline(&mut self.server_url)
+                                                .hint_text("ws://127.0.0.1:3001"),
+                                        );
+                                        if server_response.lost_focus() && server_response.changed() {
+                                            self.persist_settings();
+                                        }
+                                    });
+                                },
+                            );
 
-                        ui.horizontal(|ui| {
-                            ui.add_sized(
-                                [58.0, 26.0],
-                                egui::Label::new(egui::RichText::new("Server").strong()),
-                            );
-                            let server_response = ui.add_sized(
-                                [ui.available_width() - 2.0, 26.0],
-                                egui::TextEdit::singleline(&mut self.server_url)
-                                    .hint_text("ws://127.0.0.1:3001"),
-                            );
-                            if server_response.lost_focus() && server_response.changed() {
-                                self.persist_settings();
-                            }
+                            ui.add_space(gap);
+                            self.draw_latency_graph(ui, graph_size);
                         });
                     });
         });
