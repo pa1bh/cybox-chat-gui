@@ -19,6 +19,7 @@ pub enum UiEvent {
     Connected,
     Disconnected(Option<String>),
     Incoming(Incoming),
+    Raw(String),
     Warning(String),
     Error(String),
 }
@@ -39,11 +40,15 @@ pub fn start_connection(
                     ctx.request_repaint();
 
                     let (mut write, mut read) = ws_stream.split();
+                    let ui_tx_write = ui_tx.clone();
+                    let ctx_write = ctx.clone();
                     let write_handle = tokio::spawn(async move {
                         while let Some(cmd) = ws_rx.recv().await {
                             match cmd {
                                 WsCommand::Send(msg) => {
                                     let json = serde_json::to_string(&msg).unwrap();
+                                    let _ = ui_tx_write.send(UiEvent::Raw(format!(">> {}", json)));
+                                    ctx_write.request_repaint();
                                     if write.send(Message::Text(json.into())).await.is_err() {
                                         break;
                                     }
@@ -59,16 +64,19 @@ pub fn start_connection(
                     let mut emitted_disconnect = false;
                     while let Some(msg) = read.next().await {
                         match msg {
-                            Ok(Message::Text(text)) => match parse_incoming_text(&text) {
-                                IncomingParse::Message(incoming) => {
-                                    let _ = ui_tx.send(UiEvent::Incoming(incoming));
-                                    ctx.request_repaint();
+                            Ok(Message::Text(text)) => {
+                                let _ = ui_tx.send(UiEvent::Raw(format!("<< {}", text)));
+                                match parse_incoming_text(&text) {
+                                    IncomingParse::Message(incoming) => {
+                                        let _ = ui_tx.send(UiEvent::Incoming(incoming));
+                                        ctx.request_repaint();
+                                    }
+                                    IncomingParse::Warning(warning) => {
+                                        let _ = ui_tx.send(UiEvent::Warning(warning));
+                                        ctx.request_repaint();
+                                    }
                                 }
-                                IncomingParse::Warning(warning) => {
-                                    let _ = ui_tx.send(UiEvent::Warning(warning));
-                                    ctx.request_repaint();
-                                }
-                            },
+                            }
                             Ok(Message::Close(_)) => break,
                             Err(err) => {
                                 emitted_disconnect = true;

@@ -16,6 +16,7 @@ use settings::{load_settings, save_settings, AppSettings};
 const AUTO_PING_INTERVAL_SECS: u64 = 5;
 const MAX_LATENCY_SAMPLES: usize = 100;
 const AUTO_PING_PREFIX: &str = "auto-";
+const MAX_RAW_MESSAGES: usize = 500;
 
 fn is_guest_name(name: &str) -> bool {
     name.trim().to_ascii_lowercase().starts_with("guest-")
@@ -58,6 +59,7 @@ struct ChatApp {
     server_url: String,
     input: String,
     messages: Vec<ChatLine>,
+    raw_messages: VecDeque<String>,
     connected: bool,
     preferred_username: String,
     username: String,
@@ -85,6 +87,7 @@ impl Default for ChatApp {
             server_url: settings.server_url,
             input: String::new(),
             messages: Vec::new(),
+            raw_messages: VecDeque::new(),
             connected: false,
             preferred_username,
             username: settings.username,
@@ -342,7 +345,17 @@ impl ChatApp {
                             at,
                         });
                     }
+                    UiEvent::Raw(line) => {
+                        self.record_raw_line(line);
+                    }
                 }
+        }
+    }
+
+    fn record_raw_line(&mut self, line: String) {
+        self.raw_messages.push_back(line);
+        while self.raw_messages.len() > MAX_RAW_MESSAGES {
+            let _ = self.raw_messages.pop_front();
         }
     }
 
@@ -911,25 +924,89 @@ impl eframe::App for ChatApp {
                 .rounding(egui::Rounding::same(12.0))
                 .inner_margin(egui::Margin::symmetric(10.0, 10.0))
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for line in &self.messages {
-                                self.render_chat_line(ui, line);
-                                ui.add_space(6.0);
-                            }
-                            if self.messages.is_empty() {
-                                ui.add_space(12.0);
-                                ui.centered_and_justified(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("Nog geen berichten. Verbind en start de chat.")
-                                            .italics()
-                                            .color(egui::Color32::from_gray(166)),
-                                    );
-                                });
-                            }
+                    let gap = 8.0;
+                    let total_w = ui.available_width();
+                    let left_w = ((total_w - gap) * 0.66).max(220.0);
+                    let right_w = (total_w - gap - left_w).max(140.0);
+                    let panel_h = ui.available_height();
+
+                    ui.horizontal(|ui| {
+                        ui.push_id("chat_pane", |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(left_w, panel_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    egui::Frame::default()
+                                        .fill(egui::Color32::from_rgba_unmultiplied(19, 26, 36, 210))
+                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(46, 63, 84)))
+                                        .rounding(egui::Rounding::same(10.0))
+                                        .inner_margin(egui::Margin::symmetric(8.0, 8.0))
+                                        .show(ui, |ui| {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("chat_scroll")
+                                                .auto_shrink([false, false])
+                                                .stick_to_bottom(true)
+                                                .show(ui, |ui| {
+                                                    for line in &self.messages {
+                                                        self.render_chat_line(ui, line);
+                                                        ui.add_space(6.0);
+                                                    }
+                                                    if self.messages.is_empty() {
+                                                        ui.add_space(12.0);
+                                                        ui.centered_and_justified(|ui| {
+                                                            ui.label(
+                                                                egui::RichText::new(
+                                                                    "Nog geen berichten. Verbind en start de chat.",
+                                                                )
+                                                                .italics()
+                                                                .color(egui::Color32::from_gray(166)),
+                                                            );
+                                                        });
+                                                    }
+                                                });
+                                        });
+                                },
+                            );
                         });
+
+                        ui.add_space(gap);
+
+                        ui.push_id("raw_pane", |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(right_w, panel_h),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    egui::Frame::default()
+                                        .fill(egui::Color32::from_rgba_unmultiplied(17, 23, 33, 220))
+                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 67, 90)))
+                                        .rounding(egui::Rounding::same(10.0))
+                                        .inner_margin(egui::Margin::symmetric(8.0, 8.0))
+                                        .show(ui, |ui| {
+                                            ui.label(
+                                                egui::RichText::new("Raw WebSocket")
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(176, 209, 243)),
+                                            );
+                                            ui.add_space(4.0);
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("raw_scroll")
+                                                .auto_shrink([false, false])
+                                                .stick_to_bottom(true)
+                                                .show(ui, |ui| {
+                                                    for raw in &self.raw_messages {
+                                                        ui.label(
+                                                            egui::RichText::new(raw)
+                                                                .monospace()
+                                                                .size(11.0)
+                                                                .color(egui::Color32::from_rgb(153, 181, 214)),
+                                                        );
+                                                    }
+                                                });
+                                        });
+                                },
+                            );
+                        });
+                    });
                 });
         });
     }
@@ -938,8 +1015,8 @@ impl eframe::App for ChatApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([960.0, 680.0])
-            .with_min_inner_size([640.0, 420.0]),
+            .with_inner_size([1180.0, 700.0])
+            .with_min_inner_size([820.0, 480.0]),
         ..Default::default()
     };
 
