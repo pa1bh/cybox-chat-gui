@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{channel, Receiver};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use tokio::sync::mpsc::UnboundedSender;
@@ -9,7 +9,7 @@ mod network;
 mod protocol;
 mod settings;
 
-use network::{start_connection, UiEvent, WsCommand};
+use network::{start_connection, SecurityInfo, UiEvent, WsCommand};
 use protocol::{format_at_prefix, format_uptime, parse_user_input, Incoming, Outgoing, ParsedInput};
 use settings::{load_settings, save_settings, AppSettings};
 
@@ -17,6 +17,22 @@ const AUTO_PING_INTERVAL_SECS: u64 = 5;
 const MAX_LATENCY_SAMPLES: usize = 100;
 const AUTO_PING_PREFIX: &str = "auto-";
 const MAX_RAW_MESSAGES: usize = 500;
+
+#[derive(Clone)]
+struct RawLine {
+    line: String,
+    payload: String,
+}
+
+#[derive(Default, Clone)]
+struct Metrics {
+    ws_in_frames: u64,
+    ws_out_frames: u64,
+    reconnects: u64,
+    connect_count: u64,
+    last_connected_at: Option<Instant>,
+    error_timestamps: VecDeque<Instant>,
+}
 
 fn is_guest_name(name: &str) -> bool {
     name.trim().to_ascii_lowercase().starts_with("guest-")
@@ -59,7 +75,8 @@ struct ChatApp {
     server_url: String,
     input: String,
     messages: Vec<ChatLine>,
-    raw_messages: VecDeque<String>,
+    raw_messages: VecDeque<RawLine>,
+    selected_raw_index: Option<usize>,
     connected: bool,
     preferred_username: String,
     username: String,
@@ -72,6 +89,8 @@ struct ChatApp {
     pending_pings: HashMap<String, Instant>,
     latency_samples: VecDeque<f32>,
     last_auto_ping_sent: Option<Instant>,
+    security_info: Option<SecurityInfo>,
+    metrics: Metrics,
     theme_initialized: bool,
 }
 
@@ -88,6 +107,7 @@ impl Default for ChatApp {
             input: String::new(),
             messages: Vec::new(),
             raw_messages: VecDeque::new(),
+            selected_raw_index: None,
             connected: false,
             preferred_username,
             username: settings.username,
@@ -96,6 +116,8 @@ impl Default for ChatApp {
             pending_pings: HashMap::new(),
             latency_samples: VecDeque::new(),
             last_auto_ping_sent: None,
+            security_info: None,
+            metrics: Metrics::default(),
             theme_initialized: false,
         }
     }
@@ -172,6 +194,11 @@ impl ChatApp {
         for event in events {
             match event {
                     UiEvent::Connected => {
+                        if self.metrics.connect_count > 0 {
+                            self.metrics.reconnects += 1;
+                        }
+                        self.metrics.connect_count += 1;
+                        self.metrics.last_connected_at = Some(Instant::now());
                         self.connected = true;
                         self.last_auto_ping_sent = Some(Instant::now());
                         if !self.preferred_username.trim().is_empty()
@@ -200,9 +227,11 @@ impl ChatApp {
                         });
                     }
                     UiEvent::Warning(text) => {
+                        self.record_error_event();
                         self.messages.push(ChatLine::Error(text));
                     }
                     UiEvent::Error(text) => {
+                        self.record_error_event();
                         self.messages.push(ChatLine::Error(text));
                     }
                     UiEvent::Incoming(Incoming::Chat { from, text, at }) => {
@@ -346,16 +375,48 @@ impl ChatApp {
                         });
                     }
                     UiEvent::Raw(line) => {
-                        self.record_raw_line(line);
+                        self.record_raw_line(line.clone());
+                        if line.starts_with(">> ") {
+                            self.metrics.ws_out_frames += 1;
+                        } else if line.starts_with("<< ") {
+                            self.metrics.ws_in_frames += 1;
+                        }
+                    }
+                    UiEvent::Security(info) => {
+                        self.security_info = Some(info);
                     }
                 }
         }
     }
 
+    fn record_error_event(&mut self) {
+        let now = Instant::now();
+        self.metrics.error_timestamps.push_back(now);
+        self.prune_old_errors(now);
+    }
+
+    fn prune_old_errors(&mut self, now: Instant) {
+        while let Some(oldest) = self.metrics.error_timestamps.front() {
+            if now.duration_since(*oldest) > Duration::from_secs(60) {
+                let _ = self.metrics.error_timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
     fn record_raw_line(&mut self, line: String) {
-        self.raw_messages.push_back(line);
+        let payload = line
+            .strip_prefix(">> ")
+            .or_else(|| line.strip_prefix("<< "))
+            .unwrap_or(&line)
+            .to_string();
+        self.raw_messages.push_back(RawLine { line, payload });
         while self.raw_messages.len() > MAX_RAW_MESSAGES {
             let _ = self.raw_messages.pop_front();
+            if let Some(sel) = self.selected_raw_index {
+                self.selected_raw_index = sel.checked_sub(1);
+            }
         }
     }
 
@@ -488,6 +549,180 @@ impl ChatApp {
             egui::FontId::proportional(10.0),
             egui::Color32::from_gray(138),
         );
+    }
+
+    fn latency_avg_ms(&self) -> Option<f32> {
+        if self.latency_samples.is_empty() {
+            return None;
+        }
+        let sum: f32 = self.latency_samples.iter().copied().sum();
+        Some(sum / self.latency_samples.len() as f32)
+    }
+
+    fn latency_p95_ms(&self) -> Option<f32> {
+        if self.latency_samples.is_empty() {
+            return None;
+        }
+        let mut values = self.latency_samples.iter().copied().collect::<Vec<_>>();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((values.len() as f32) * 0.95).ceil() as usize;
+        values.get(idx.saturating_sub(1)).copied()
+    }
+
+    fn render_metrics_panel(&mut self, ui: &mut egui::Ui) {
+        self.prune_old_errors(Instant::now());
+        egui::CollapsingHeader::new("Metrics")
+            .default_open(false)
+            .show(ui, |ui| {
+                let errors_per_min = self.metrics.error_timestamps.len();
+                let avg = self
+                    .latency_avg_ms()
+                    .map(|v| format!("{:.1} ms", v))
+                    .unwrap_or_else(|| "-".to_string());
+                let p95 = self
+                    .latency_p95_ms()
+                    .map(|v| format!("{:.1} ms", v))
+                    .unwrap_or_else(|| "-".to_string());
+
+                let rows = vec![
+                    ("Frames in", self.metrics.ws_in_frames.to_string()),
+                    ("Frames out", self.metrics.ws_out_frames.to_string()),
+                    ("Reconnects", self.metrics.reconnects.to_string()),
+                    ("Avg latency", avg),
+                    ("P95 latency", p95),
+                    ("Errors/min", errors_per_min.to_string()),
+                ];
+                for (k, v) in rows {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [92.0, 16.0],
+                            egui::Label::new(
+                                egui::RichText::new(k)
+                                    .small()
+                                    .color(egui::Color32::from_gray(160)),
+                            ),
+                        );
+                        ui.label(
+                            egui::RichText::new(v)
+                                .small()
+                                .color(egui::Color32::from_rgb(190, 216, 244)),
+                        );
+                    });
+                }
+            });
+    }
+
+    fn render_security_panel(&self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Security / TLS")
+            .default_open(false)
+            .show(ui, |ui| {
+                if let Some(info) = &self.security_info {
+                    let rows = vec![
+                        ("URL", info.url.clone()),
+                        ("Transport", info.transport.clone()),
+                        (
+                            "TLS",
+                            if info.tls {
+                                "enabled".to_string()
+                            } else {
+                                "not enabled".to_string()
+                            },
+                        ),
+                        (
+                            "HTTP status",
+                            info.http_status
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                        ),
+                    ];
+                    for (k, v) in rows {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_sized(
+                                [84.0, 16.0],
+                                egui::Label::new(
+                                    egui::RichText::new(k)
+                                        .small()
+                                        .color(egui::Color32::from_gray(160)),
+                                ),
+                            );
+                            ui.label(
+                                egui::RichText::new(v)
+                                    .small()
+                                    .color(egui::Color32::from_rgb(190, 216, 244)),
+                            );
+                        });
+                    }
+                    if !info.headers.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Handshake headers")
+                                .small()
+                                .strong()
+                                .color(egui::Color32::from_rgb(164, 198, 233)),
+                        );
+                        for (k, v) in info.headers.iter().take(8) {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{}:", k))
+                                        .small()
+                                        .color(egui::Color32::from_gray(160)),
+                                );
+                                ui.label(
+                                    egui::RichText::new(v)
+                                        .small()
+                                        .monospace()
+                                        .color(egui::Color32::from_rgb(156, 185, 215)),
+                                );
+                            });
+                        }
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new("Nog geen handshake info (nog niet verbonden).")
+                            .small()
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                }
+            });
+    }
+
+    fn render_json_value(ui: &mut egui::Ui, key: Option<&str>, value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                let title = key.unwrap_or("{object}");
+                egui::CollapsingHeader::new(title).default_open(true).show(ui, |ui| {
+                    for (k, v) in map {
+                        Self::render_json_value(ui, Some(k), v);
+                    }
+                });
+            }
+            serde_json::Value::Array(arr) => {
+                let title = key.unwrap_or("[array]");
+                egui::CollapsingHeader::new(format!("{} [{}]", title, arr.len()))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for (idx, v) in arr.iter().enumerate() {
+                            Self::render_json_value(ui, Some(&format!("[{}]", idx)), v);
+                        }
+                    });
+            }
+            _ => {
+                let label = key.unwrap_or("value");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(label)
+                            .small()
+                            .color(egui::Color32::from_gray(160)),
+                    );
+                    ui.label(
+                        egui::RichText::new(value.to_string())
+                            .small()
+                            .monospace()
+                            .color(egui::Color32::from_rgb(180, 212, 244)),
+                    );
+                });
+            }
+        }
     }
 
     fn apply_modern_theme(&mut self, ctx: &egui::Context) {
@@ -716,9 +951,12 @@ impl eframe::App for ChatApp {
                     .outer_margin(egui::Margin::symmetric(6.0, 2.0))
                     .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                     .show(ui, |ui| {
-                        let graph_size = egui::vec2(285.0, 68.0);
+                        let graph_h = 68.0;
                         let gap = 8.0;
-                        let left_width = (ui.available_width() - graph_size.x - gap).max(220.0);
+                        let total_w = ui.available_width();
+                        let graph_w = (total_w * 0.333).max(260.0);
+                        let left_width = (total_w - graph_w - gap).max(220.0);
+                        let graph_size = egui::vec2(graph_w, graph_h);
 
                         ui.horizontal_top(|ui| {
                             ui.allocate_ui_with_layout(
@@ -833,6 +1071,7 @@ impl eframe::App for ChatApp {
                                         let server_response = ui.add_sized(
                                             [ui.available_width() - 2.0, 22.0],
                                             egui::TextEdit::singleline(&mut self.server_url)
+                                                .vertical_align(egui::Align::Center)
                                                 .hint_text("ws://127.0.0.1:3001"),
                                         );
                                         if server_response.lost_focus() && server_response.changed() {
@@ -862,6 +1101,7 @@ impl eframe::App for ChatApp {
                             let response = ui.add_sized(
                                 [ui.available_width() - 84.0, 26.0],
                                 egui::TextEdit::singleline(&mut self.input)
+                                    .vertical_align(egui::Align::Center)
                                     .hint_text("Type a message or /command..."),
                             );
 
@@ -987,18 +1227,97 @@ impl eframe::App for ChatApp {
                                                     .strong()
                                                     .color(egui::Color32::from_rgb(176, 209, 243)),
                                             );
-                                            ui.add_space(4.0);
+                                            self.render_metrics_panel(ui);
+                                            self.render_security_panel(ui);
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new("Frames")
+                                                    .small()
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(164, 198, 233)),
+                                            );
+                                            let available_h = ui.available_height();
+                                            let frames_h =
+                                                (available_h * 0.65).clamp(220.0, 520.0);
+                                            let inspector_h =
+                                                (available_h * 0.28).clamp(110.0, 260.0);
                                             egui::ScrollArea::vertical()
                                                 .id_salt("raw_scroll")
+                                                .max_height(frames_h)
                                                 .auto_shrink([false, false])
                                                 .stick_to_bottom(true)
                                                 .show(ui, |ui| {
-                                                    for raw in &self.raw_messages {
+                                                    for (idx, raw) in self.raw_messages.iter().enumerate() {
+                                                        let selected = self.selected_raw_index == Some(idx);
+                                                        if ui
+                                                            .selectable_label(
+                                                                selected,
+                                                                egui::RichText::new(&raw.line)
+                                                                    .monospace()
+                                                                    .size(10.5)
+                                                                    .color(egui::Color32::from_rgb(
+                                                                        153, 181, 214,
+                                                                    )),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            self.selected_raw_index = Some(idx);
+                                                        }
+                                                    }
+                                                });
+                                            ui.add_space(4.0);
+                                            ui.label(
+                                                egui::RichText::new("JSON Inspector")
+                                                    .small()
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(164, 198, 233)),
+                                            );
+                                            egui::ScrollArea::vertical()
+                                                .id_salt("json_inspector_scroll")
+                                                .max_height(inspector_h)
+                                                .auto_shrink([false, false])
+                                                .stick_to_bottom(false)
+                                                .show(ui, |ui| {
+                                                    if let Some(idx) = self.selected_raw_index {
+                                                        if let Some(raw) = self.raw_messages.get(idx) {
+                                                            match serde_json::from_str::<serde_json::Value>(
+                                                                &raw.payload,
+                                                            ) {
+                                                                Ok(value) => {
+                                                                    Self::render_json_value(
+                                                                        ui,
+                                                                        None,
+                                                                        &value,
+                                                                    );
+                                                                }
+                                                                Err(_) => {
+                                                                    ui.label(
+                                                                        egui::RichText::new(
+                                                                            "Geselecteerde regel is geen geldige JSON.",
+                                                                        )
+                                                                        .small()
+                                                                        .color(egui::Color32::from_gray(160)),
+                                                                    );
+                                                                    ui.label(
+                                                                        egui::RichText::new(
+                                                                            &raw.payload,
+                                                                        )
+                                                                        .small()
+                                                                        .monospace()
+                                                                        .color(egui::Color32::from_rgb(
+                                                                            153, 181, 214,
+                                                                        )),
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    } else {
                                                         ui.label(
-                                                            egui::RichText::new(raw)
-                                                                .monospace()
-                                                                .size(11.0)
-                                                                .color(egui::Color32::from_rgb(153, 181, 214)),
+                                                            egui::RichText::new(
+                                                                "Selecteer een raw frame voor inspectie.",
+                                                            )
+                                                            .small()
+                                                            .color(egui::Color32::from_gray(160)),
                                                         );
                                                     }
                                                 });
@@ -1015,8 +1334,8 @@ impl eframe::App for ChatApp {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1180.0, 700.0])
-            .with_min_inner_size([820.0, 480.0]),
+            .with_inner_size([1180.0, 980.0])
+            .with_min_inner_size([820.0, 672.0]),
         ..Default::default()
     };
 

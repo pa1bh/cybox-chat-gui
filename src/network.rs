@@ -15,11 +15,21 @@ pub enum WsCommand {
 }
 
 #[derive(Debug, Clone)]
+pub struct SecurityInfo {
+    pub url: String,
+    pub transport: String,
+    pub tls: bool,
+    pub http_status: Option<u16>,
+    pub headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
 pub enum UiEvent {
     Connected,
     Disconnected(Option<String>),
     Incoming(Incoming),
     Raw(String),
+    Security(SecurityInfo),
     Warning(String),
     Error(String),
 }
@@ -35,7 +45,29 @@ pub fn start_connection(
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             match tokio_tungstenite::connect_async(&url).await {
-                Ok((ws_stream, _)) => {
+                Ok((ws_stream, response)) => {
+                    let transport = if url.to_ascii_lowercase().starts_with("wss://") {
+                        "wss".to_string()
+                    } else {
+                        "ws".to_string()
+                    };
+                    let headers = response
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.as_str().to_string(),
+                                v.to_str().unwrap_or("<non-utf8>").to_string(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let _ = ui_tx.send(UiEvent::Security(SecurityInfo {
+                        url: url.clone(),
+                        transport: transport.clone(),
+                        tls: transport == "wss",
+                        http_status: Some(response.status().as_u16()),
+                        headers,
+                    }));
                     let _ = ui_tx.send(UiEvent::Connected);
                     ctx.request_repaint();
 
